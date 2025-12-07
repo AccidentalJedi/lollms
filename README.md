@@ -8,7 +8,7 @@ One tool to rule them all!
 
 A multi-user FastAPI backend and responsive Vue/Tailwind CSS frontend application designed to provide a chat interface powered by the [`lollms_client`](https://github.com/ParisNeo/lollms_client) library. It features integrated Retrieval-Augmented Generation (RAG) using [`safe_store`](https://github.com/ParisNeo/safe_store), a versatile personality system, multimodal chat, user management, a friend system with direct messaging, and enhanced sharing capabilities.
 
-**Live Project:** [https://github.com/ParisNeo/lollms](https://github.com/ParisNeo/lollms)
+**Live Project:** [https://github.com/Grumpified-OGGVCT/lollms](https://github.com/Grumpified-OGGVCT/lollms)
 
 ## ✨ Features
 
@@ -47,7 +47,7 @@ The easiest way to get started is by using the provided run scripts, which handl
 
 1.  **Clone the Repository:**
     ```bash
-    git clone https://github.com/ParisNeo/lollms.git
+    git clone https://github.com/Grumpified-OGGVCT/lollms.git
     cd lollms
     ```
 

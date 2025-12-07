@@ -49,7 +49,8 @@ export const useSocialStore = defineStore('social', () => {
     async function searchForMentions(query) {
         if (!query) return [];
         try {
-            const response = await apiClient.get('/api/users/mention_search', { params: { q: query } });
+            // Using the specialized social mentions endpoint for better context (friends, bot, etc.)
+            const response = await apiClient.get('/api/social/mentions/search', { params: { q: query } });
             return response.data;
         } catch (error) {
             console.error("Failed to search for mentions:", error);
@@ -438,8 +439,11 @@ export const useSocialStore = defineStore('social', () => {
             });
             const msg = res.data;
             
+            // We manually push here for immediate UI update, but the WebSocket might also arrive.
+            // Duplicate ID check is handled in handleNewDm, but we should do it here too just in case.
             if (activeConversations.value[targetId]) {
-                activeConversations.value[targetId].messages.push(msg);
+                const exists = activeConversations.value[targetId].messages.some(m => m.id === msg.id);
+                if (!exists) activeConversations.value[targetId].messages.push(msg);
             }
             
             const listIndex = conversations.value.findIndex(c => isGroup ? c.id === targetId : c.partner_user_id === targetId);
@@ -516,11 +520,13 @@ export const useSocialStore = defineStore('social', () => {
         let convoKey = message.conversation_id || (message.sender_id === currentUser.id ? message.receiver_id : message.sender_id);
         let isGroup = !!message.conversation_id;
 
+        // Push message to active conversation cache if exists (De-duplication critical here)
         if (activeConversations.value[convoKey]) {
             const exists = activeConversations.value[convoKey].messages.some(m => m.id === message.id);
             if (!exists) activeConversations.value[convoKey].messages.push(message);
         }
 
+        // Update conversation list summary
         let listIndex = isGroup ? conversations.value.findIndex(c => c.id === convoKey && c.is_group) : conversations.value.findIndex(c => !c.is_group && c.partner_user_id === convoKey);
         
         if (listIndex > -1) {
@@ -530,9 +536,11 @@ export const useSocialStore = defineStore('social', () => {
             if (message.sender_id !== currentUser.id) convo.unread_count = (convo.unread_count || 0) + 1;
             conversations.value.unshift(convo);
         } else {
+            // New conversation discovered via websocket
             fetchConversations();
         }
         
+        // Notification for new message if not in active view
         if (message.sender_id !== currentUser.id && activeConversationId.value !== convoKey) {
              uiStore.addNotification(`New message from ${message.sender_username}`, 'info');
         }
@@ -602,8 +610,36 @@ export const useSocialStore = defineStore('social', () => {
     }
 
     return {
-        friends, conversations, activeConversations, activeConversationId,
-        totalUnreadDms, friendRequestCount, isLoadingFriends, isLoadingConversations,
+        // STATE EXPORTS
+        friends, 
+        pendingFriendRequests, 
+        blockedUsers, 
+        feedPosts, // EXPORTED
+        profiles, // EXPORTED
+        userPosts, // EXPORTED
+        comments, // EXPORTED
+        conversations, 
+        activeConversations, 
+        activeConversationId,
+        
+        // LOADING STATES
+        isLoadingFriends, 
+        isLoadingFeed, // EXPORTED
+        isLoadingProfile, // EXPORTED
+        isLoadingRequests, // EXPORTED
+        isLoadingBlocked, // EXPORTED
+        isLoadingComments, // EXPORTED
+        isLoadingConversations, 
+        isLoadingMessages, // EXPORTED
+
+        // COMPUTED / GETTERS
+        totalUnreadDms, 
+        friendRequestCount,
+        getPostsByUsername, // EXPORTED
+        getActiveConversation,
+        getCommentsForPost,
+
+        // ACTIONS
         fetchFriends, fetchConversations, openConversation, sendDirectMessage,
         deleteMessage, deleteConversation, exportConversation, importConversation, createGroupConversation, addMemberToGroup,
         fetchPendingRequests, fetchBlockedUsers, fetchUserProfile, sendFriendRequest, acceptFriendRequest, rejectFriendRequest, removeFriend, blockUser, unblockUser,

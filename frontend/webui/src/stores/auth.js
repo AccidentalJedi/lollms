@@ -33,7 +33,14 @@ export const useAuthStore = defineStore('auth', () => {
     // --- WebSocket State ---
     const ws = ref(null);
     const wsConnected = ref(false);
+    const hasConnectedOnce = ref(false); // Track initial connection for recovery detection
     let reconnectTimeout = null;
+    let heartbeatInterval = null;
+
+    // --- Audio Objects ---
+    const audioChime = new Audio('/audio/chime_aud.wav');
+    const audioLost = new Audio('/audio/connection_lost.wav');
+    const audioRecovered = new Audio('/audio/connection_recovered.wav');
 
     const isAuthenticated = computed(() => !!user.value);
     const isAdmin = computed(() => user.value?.is_admin || false);
@@ -105,12 +112,34 @@ export const useAuthStore = defineStore('auth', () => {
         ws.value = new WebSocket(wsUrl);
 
         ws.value.onopen = () => {
+            if (hasConnectedOnce.value && !wsConnected.value) {
+                audioRecovered.play().catch(() => {});
+                const uiStore = useUiStore();
+                uiStore.addNotification('Connection recovered', 'success');
+            }
+
             wsConnected.value = true;
+            hasConnectedOnce.value = true;
             clearTimeout(reconnectTimeout);
+            // Start heartbeat
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
+            heartbeatInterval = setInterval(() => {
+                if (ws.value && ws.value.readyState === WebSocket.OPEN) {
+                    ws.value.send("ping");
+                }
+            }, 30000); // 30s
         };
 
         ws.value.onmessage = async (event) => {
-            const data = JSON.parse(event.data);
+            if (event.data === "pong") return; // Ignore pong
+            
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch (e) {
+                return; 
+            }
+            
             const { useSocialStore } = await import('./social');
             const { useTasksStore } = await import('./tasks');
             const { useDataStore } = await import('./data');
@@ -124,7 +153,16 @@ export const useAuthStore = defineStore('auth', () => {
 
             switch (data.type) {
                 case 'new_dm': 
-                    socialStore.handleNewDm(data.data); 
+                    socialStore.handleNewDm(data.data);
+                    if (user.value && data.data.sender_id !== user.value.id) {
+                        audioChime.play().catch(() => {});
+                        if ("Notification" in window && Notification.permission === "granted") {
+                             new Notification(`Message from ${data.data.sender_username}`, {
+                                 body: data.data.content,
+                                 icon: data.data.sender_icon || '/favicon.ico'
+                             });
+                        }
+                    }
                     break;
                 case 'new_comment': 
                     socialStore.handleNewComment(data.data); 
@@ -218,28 +256,34 @@ export const useAuthStore = defineStore('auth', () => {
                     dataStore.fetchAvailableTtiModels();
                     dataStore.fetchAvailableTtsModels();
                     dataStore.fetchAvailableSttModels();
-                    // Force refresh user to pick up any context locks
                     await refreshUser();
                     break;               
             }
         };
 
         ws.value.onclose = (event) => {
+            if (wsConnected.value) {
+                audioLost.play().catch(() => {});
+                const uiStore = useUiStore();
+                uiStore.addNotification('Connection lost', 'error');
+            }
             wsConnected.value = false;
             ws.value = null;
+            if (heartbeatInterval) clearInterval(heartbeatInterval);
             if (event.code !== 1000) { 
                 reconnectTimeout = setTimeout(connectWebSocket, 5000);
             }
         };
         ws.value.onerror = (error) => {
             wsConnected.value = false;
-            ws.value?.close();
+            if (ws.value) ws.value.close();
         };
     }
 
     function disconnectWebSocket() {
         wsConnected.value = false;
         if (reconnectTimeout) clearTimeout(reconnectTimeout);
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
         if (ws.value) { 
             ws.value.close(1000, "User logout"); 
             ws.value = null; 
@@ -260,6 +304,11 @@ export const useAuthStore = defineStore('auth', () => {
                 allow_user_chunking_config.value = user.value.allow_user_chunking_config;
                 default_chunk_size.value = user.value.default_chunk_size;
                 default_chunk_overlap.value = user.value.default_chunk_overlap;
+            }
+
+            // Request notification permission on load
+            if ("Notification" in window && Notification.permission === "default") {
+                Notification.requestPermission();
             }
             
             connectWebSocket();
