@@ -1,4 +1,4 @@
-# backend/routers/social/dm.py
+# [UPDATE] backend/routers/social/dm.py
 import uuid
 import json
 import shutil
@@ -124,6 +124,10 @@ async def create_group_conversation(
         }
     }
     for m in members_public:
+        # Try direct send for instant feedback
+        if m.user_id in manager.active_connections:
+            await manager.send_personal_message(notification, m.user_id)
+        # Also queue for reliability
         if m.user_id != current_user.id:
             manager.send_personal_message_sync(notification, m.user_id)
             
@@ -175,6 +179,9 @@ async def add_member_to_group(
         
         # Notify
         notification = {"type": "conversation_update", "data": {"id": conversation_id, "action": "member_added"}}
+        # Try direct send
+        if payload.user_id in manager.active_connections:
+            await manager.send_personal_message(notification, payload.user_id)
         manager.send_personal_message_sync(notification, payload.user_id)
 
     return await get_conversation_details_internal(conversation_id, current_user.id, db)
@@ -246,14 +253,25 @@ async def send_direct_message(
         sent_at=new_message.sent_at,
         sender_username=current_user.username,
         receiver_username="", 
-        image_references=new_message.image_references
+        image_references=new_message.image_references if isinstance(new_message.image_references, list) else []
     )
 
     payload = { "type": "new_dm", "data": json.loads(resp.model_dump_json()) }
     
+    # 1. Send Immediately to recipients if connected locally (Realtime Fix)
+    for uid in recipient_ids:
+        if uid in manager.active_connections:
+            await manager.send_personal_message(payload, uid)
+            
+    # Echo back to sender immediately for consistency across tabs
+    if current_user.id in manager.active_connections:
+        await manager.send_personal_message(payload, current_user.id)
+
+    # 2. Queue for Broadcast (Multi-worker support & Persistence guarantee)
+    # The frontend is responsible for de-duplicating messages if it receives both
     for uid in recipient_ids:
         manager.send_personal_message_sync(payload, uid)
-    manager.send_personal_message_sync(payload, current_user.id) # Echo back
+    manager.send_personal_message_sync(payload, current_user.id) 
 
     return resp
 
@@ -388,7 +406,9 @@ async def get_conversation_messages(
     return [DirectMessagePublic(
         id=m.id, sender_id=m.sender_id, receiver_id=m.receiver_id or 0, conversation_id=m.conversation_id,
         content=m.content, sent_at=m.sent_at, read_at=m.read_at,
-        sender_username=m.sender.username, image_references=m.image_references
+        sender_username=m.sender.username, 
+        # Safely handle image_references being 'null' string, None, or list
+        image_references=m.image_references if isinstance(m.image_references, list) else []
     ) for m in messages]
 
 @dm_router.post("/conversation/{user_id}/read", status_code=200)
@@ -427,8 +447,6 @@ async def delete_direct_message(
     db.delete(msg)
     db.commit()
     
-    # Optionally notify recipients about deletion (not strictly required by prompt but good for consistency)
-    
     return {"message": "Message deleted"}
 
 @dm_router.delete("/conversations/{conversation_id}", status_code=200)
@@ -453,28 +471,9 @@ async def delete_conversation_or_leave_group(
             db.commit()
         return {"message": "Left group"}
     else:
-        # Delete history (virtual deletion - usually just delete all messages, but for DMs typically we might just want to clear view)
-        # True deletion for both sides? Or just hide?
-        # For simplicity, implementing delete all messages where user is sender, or delete all messages between them.
-        # Deleting strictly requires consensus or just deletes for everyone.
-        # Implementing 'Delete all messages between these two'
-        
-        # Target ID is passed as conversation_id for 1-on-1
+        # Delete ALL messages between these two users to clear history physically
         partner_id = conversation_id 
         
-        stmt = (
-            update(DBDirectMessage)
-            .where(
-                or_(
-                    and_(DBDirectMessage.sender_id == current_user.id, DBDirectMessage.receiver_id == partner_id),
-                    and_(DBDirectMessage.sender_id == partner_id, DBDirectMessage.receiver_id == current_user.id)
-                ),
-                DBDirectMessage.conversation_id == None
-            )
-            # Mark as deleted? Or physically delete.
-            # Physical delete as per prompt implication "delete discussions"
-        )
-        # SQLAlchemy delete doesn't support join/complex where in same way for some DBs, so fetch ids first
         msgs = db.query(DBDirectMessage).filter(
              or_(
                 and_(DBDirectMessage.sender_id == current_user.id, DBDirectMessage.receiver_id == partner_id),
@@ -487,7 +486,7 @@ async def delete_conversation_or_leave_group(
             db.delete(m)
         
         db.commit()
-        return {"message": "Conversation history cleared"}
+        return {"message": "Conversation deleted"}
 
 @dm_router.post("/broadcast", status_code=202)
 async def broadcast_direct_message(

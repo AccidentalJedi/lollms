@@ -1,4 +1,4 @@
-# [UPDATE] backend/routers/discussion/generation/llm.py
+# backend/routers/discussion/generation/llm.py
 # Standard Library Imports
 import base64
 import io
@@ -67,7 +67,6 @@ from lollms_client import MSG_TYPE, LollmsPersonality
 from backend.routers.discussion.helpers import get_discussion_and_owner_for_request
 
 from backend.db import get_db
-
 
 
 def build_llm_generation_router(router: APIRouter):
@@ -153,6 +152,10 @@ def build_llm_generation_router(router: APIRouter):
                 preamble_parts.append(f"- IMPORTANT: You must respond exclusively in the following language: {owner_db_user.ai_response_language}")
             else:
                 preamble_parts.append("- IMPORTANT: You must respond exclusively in the same language as the user's prompt.")
+        
+        # NEW: Share Personal Information
+        if owner_db_user.share_personal_info_with_llm and owner_db_user.user_personal_info:
+             preamble_parts.append(f"## User Personal Information:\n{owner_db_user.user_personal_info}")
 
         if owner_db_user.image_annotation_enabled:
             preamble_parts.append(
@@ -187,6 +190,20 @@ def build_llm_generation_router(router: APIRouter):
                 "```"
             )
 
+        # NEW: Note Generation Instructions
+        if getattr(owner_db_user, 'note_generation_enabled', False):
+            preamble_parts.append(
+                "## Note Generation Instructions\n"
+                "To create a note, output a code block with the language `note`. The content inside the block will be the note's body.\n"
+                "Example:\n"
+                "```note\n"
+                "# Note title\n"
+                "Structured markdown formatted note information depending on the user's request.\n"
+                "You are encouraged to use tables, lists, sections, equations ...\n"
+                "If you need to show code, use code environments with mandatory code language specifier.\n"
+                "```"
+            )
+
         if preamble_parts:
             dynamic_preamble = "## Dynamic Information\n" + "\n".join(preamble_parts) + "\n\n"
 
@@ -194,11 +211,14 @@ def build_llm_generation_router(router: APIRouter):
         
         user_data_zone = owner_db_user.data_zone or ""
         now = datetime.now()
+        # NEW: Use preferred_name if available, fallback to username
+        username_to_use = owner_db_user.preferred_name if owner_db_user.preferred_name else current_user.username
+        
         replacements = {
             "{{date}}": now.strftime("%Y-%m-%d"),
             "{{time}}": now.strftime("%H:%M:%S"),
             "{{datetime}}": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "{{user_name}}": current_user.username,
+            "{{user_name}}": username_to_use,
         }
         processed_user_data_zone = user_data_zone
         for placeholder, value in replacements.items():
@@ -304,7 +324,10 @@ def build_llm_generation_router(router: APIRouter):
                             use_data_store=use_rag, 
                             streaming_callback=llm_callback,
                             user_name=current_user.username,
-                            user_icon=current_user.icon
+                            user_icon=current_user.icon,
+                            think=owner_db_user.reasoning_activation,
+                            reasoning_effort=owner_db_user.reasoning_effort,
+                            reasooning_summary=owner_db_user.reasoning_summary
                         )
                     else:
                         result = discussion_obj.chat(
@@ -319,7 +342,11 @@ def build_llm_generation_router(router: APIRouter):
                             rag_min_similarity_percent=owner_db_user.rag_min_sim_percent,
                             debug=SERVER_CONFIG.get("debug", False),
                             user_name=current_user.username,
-                            user_icon=current_user.icon
+                            user_icon=current_user.icon,
+
+                            think=owner_db_user.reasoning_activation,
+                            reasoning_effort=owner_db_user.reasoning_effort,
+                            reasooning_summary=owner_db_user.reasoning_summary
                         )
                     
                     end_time = time.time()

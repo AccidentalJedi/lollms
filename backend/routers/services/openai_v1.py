@@ -6,15 +6,18 @@ import asyncio
 import threading
 import uuid
 import base64
+import re
 import io
+import random
+import string
 from pathlib import Path
-from typing import List, Optional, Dict, Tuple, Union
+from typing import List, Optional, Dict, Tuple, Union, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import or_
-from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, Field
 
 from backend.db import get_db
@@ -27,25 +30,41 @@ from backend.session import user_sessions, build_lollms_client_from_params, get_
 from backend.settings import settings
 from lollms_client import LollmsPersonality, MSG_TYPE
 from ascii_colors import ASCIIColors, trace_exception
-from backend.routers.files import extract_text_from_file_bytes # NEW IMPORT
+from backend.routers.files import extract_text_from_file_bytes 
 
+# --- Router Definition ---
 openai_v1_router = APIRouter(prefix="/v1")
-bearer_scheme = HTTPBearer(auto_error=False) # Set auto_error to False to handle optional auth
+bearer_scheme = HTTPBearer(auto_error=False) 
 
 # --- Pydantic Models for OpenAI Compatibility ---
 
+class FunctionCall(BaseModel):
+    name: Optional[str] = None
+    arguments: Optional[str] = None
+
+class ToolCall(BaseModel):
+    index: Optional[int] = None
+    id: Optional[str] = None
+    type: str = "function"
+    function: FunctionCall
+
 class ChatMessage(BaseModel):
     role: str
-    content: str|List[Dict]
+    content: Optional[Union[str, List[Dict]]] = None
+    tool_calls: Optional[List[ToolCall]] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    personality: Optional[str] = None # New field for personality
+    personality: Optional[str] = None 
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
     stream: Optional[bool] = False
-    # Other parameters can be added here if needed
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    reasoning_effort: Optional[str] = None
 
 class UsageInfo(BaseModel):
     prompt_tokens: int
@@ -69,6 +88,7 @@ class ChatCompletionResponse(BaseModel):
 class DeltaMessage(BaseModel):
     role: Optional[str] = None
     content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
@@ -107,7 +127,7 @@ class EmbeddingRequest(BaseModel):
     input: Union[str, List[str]]
     model: str
     encoding_format: Optional[str] = "float"
-    user: Optional[str] = None # Not used by us, but part of OpenAI spec
+    user: Optional[str] = None
 
 class EmbeddingObject(BaseModel):
     object: str = "embedding"
@@ -179,7 +199,6 @@ class FileExtractionResponse(BaseModel):
 
 # --- NEW HELPER FUNCTIONS for model resolution ---
 def find_model_by_alias(db: Session, alias_title: str) -> Optional[Tuple[str, str]]:
-    """Finds the original binding alias and model name from a display alias title."""
     all_bindings = db.query(DBLLMBinding).filter(DBLLMBinding.is_active == True).all()
     for binding in all_bindings:
         model_aliases = binding.model_aliases or {}
@@ -193,22 +212,21 @@ def find_model_by_alias(db: Session, alias_title: str) -> Optional[Tuple[str, st
     return None, None
 
 def resolve_model_name(db: Session, requested_model: str) -> Tuple[str, str]:
-    """Resolves a requested model name (which could be an alias) to its binding_alias and original model_name."""
-    # 1. First, check if it's already in the format "binding/model"
     if '/' in requested_model:
         parts = requested_model.split('/', 1)
-        # Verify this is a valid binding
         binding = db.query(DBLLMBinding).filter(DBLLMBinding.alias == parts[0], DBLLMBinding.is_active == True).first()
         if binding:
             return parts[0], parts[1]
     
-    # 2. If not, treat it as an alias and search for it.
     binding_alias, model_name = find_model_by_alias(db, requested_model)
     if binding_alias:
         return binding_alias, model_name
 
-    # 3. If it's not found either way, raise an error.
     raise HTTPException(status_code=400, detail=f"Model '{requested_model}' not found. Please use 'binding/model_name' format or a valid alias.")
+
+def generate_mistral_compatible_id() -> str:
+    """Generates a 9-character alphanumeric ID required by Mistral/LiteLLM."""
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=9))
 
 # --- END HELPER FUNCTIONS ---
 
@@ -219,22 +237,16 @@ async def get_user_from_api_key(
     authorization: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: Session = Depends(get_db)
 ) -> DBUser:
-    """
-    Authenticates a user based on a given API key or, if disabled, falls back to an admin user.
-    """
     if not settings.get("openai_api_service_enabled", False):
         raise HTTPException(status_code=403, detail="OpenAI API service is not enabled by the administrator.")
 
     require_key = settings.get("openai_api_require_key", True)
 
-    # --- CORRECTED LOGIC ---
     if not require_key:
-        # Key requirement is OFF. Immediately fall back to the admin user, ignoring any 'authorization' header.
         admin_user = db.query(DBUser).filter(DBUser.is_admin == True).order_by(DBUser.id).first()
         if not admin_user:
             raise HTTPException(status_code=503, detail="OpenAI API is enabled without a key, but no admin user is configured to handle requests.")
         
-        # Ensure a session exists for this admin user to build clients correctly
         if admin_user.username not in user_sessions:
             session_llm_params = {
                 "ctx_size": admin_user.llm_ctx_size, "temperature": admin_user.llm_temperature,
@@ -250,7 +262,6 @@ async def get_user_from_api_key(
             }
         return admin_user
 
-    # --- If we reach here, 'require_key' is TRUE ---
     if not authorization:
         raise HTTPException(status_code=401, detail="API Key is required.", headers={"WWW-Authenticate": "Bearer"})
 
@@ -287,13 +298,12 @@ async def get_user_from_api_key(
             "active_personality_id": user.active_personality_id,
         }
 
-    # Mark the key as used. The commit will be handled by FastAPI's dependency management.
     db_key.last_used_at = datetime.datetime.now(datetime.timezone.utc)
     
     return user
 
 # --- Helper to Extract Images and Convert Messages ---
-def preprocess_openai_messages(messages: List["ChatMessage"]) -> Tuple[List[Dict], List[str]]:
+def preprocess_openai_messages(messages: List[ChatMessage]) -> Tuple[List[Dict], List[str]]:
     processed = []
     image_list = []
 
@@ -302,6 +312,18 @@ def preprocess_openai_messages(messages: List["ChatMessage"]) -> Tuple[List[Dict
             "role": msg.role,
             "content": msg.content
         }
+
+        if msg.tool_call_id:
+            msg_dict["tool_call_id"] = msg.tool_call_id
+
+        if msg.name:
+            msg_dict["name"] = msg.name
+
+        if msg.tool_calls:
+            msg_dict["tool_calls"] = [
+                tc.model_dump() if hasattr(tc, 'model_dump') else tc
+                for tc in msg.tool_calls
+            ]
 
         if isinstance(msg.content, list):
             for item in msg.content:
@@ -322,6 +344,221 @@ def preprocess_openai_messages(messages: List["ChatMessage"]) -> Tuple[List[Dict
     return processed, image_list
 
 
+def handle_tools_injection(messages: List[Dict], tools: List[Dict], tool_choice: Union[str, Dict] = None) -> List[Dict]:
+    """
+    Injects tool definitions into the system prompt.
+    Explicitly instructs the model to use multiline JSON in markdown blocks.
+    """
+    ASCIIColors.yellow("--- TOOL INJECTION START ---")
+    
+    if isinstance(tool_choice, str) and tool_choice == "none":
+        ASCIIColors.yellow("Tool choice is 'none'. Skipping injection.")
+        return messages
+
+    if not tools:
+        ASCIIColors.yellow("No tools provided in request.")
+        return messages
+
+    ASCIIColors.info(f"Processing {len(tools)} tools...")
+
+    tools_prompt = "\n\n### FUNCTION CALLING INSTRUCTIONS\n"
+    tools_prompt += "You are an AI assistant capable of calling external functions.\n"
+    tools_prompt += "To call a function, you MUST output a JSON object wrapped in a markdown code block.\n"
+    tools_prompt += "Please write the JSON on multiple lines inside the code block for clarity.\n\n"
+    tools_prompt += "Example:\n"
+    tools_prompt += "```json\n"
+    tools_prompt += "{\n"
+    tools_prompt += '  "tool_calls": [\n'
+    tools_prompt += '    {\n'
+    tools_prompt += '      "name": "my_func",\n'
+    tools_prompt += '      "arguments": {\n'
+    tools_prompt += '        "arg": "value"\n'
+    tools_prompt += '      }\n'
+    tools_prompt += '    }\n'
+    tools_prompt += '  ]\n'
+    tools_prompt += "}\n"
+    tools_prompt += "```\n"
+    
+    tools_prompt += "### AVAILABLE TOOLS:\n"
+    for tool in tools:
+        t_type = tool.get("type", "function")
+        if t_type == "function":
+            func = tool.get("function", {})
+            name = func.get("name")
+            desc = func.get("description", "No description provided.")
+            params = json.dumps(func.get("parameters", {}))
+            tools_prompt += f"- Function: {name}\n  Description: {desc}\n  Parameters: {params}\n\n"
+
+    if isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+        forced_name = tool_choice.get("function", {}).get("name")
+        tools_prompt += f"IMPORTANT: You MUST choose to call the function '{forced_name}' in your response.\n"
+        ASCIIColors.cyan(f"Forcing tool usage: {forced_name}")
+    elif tool_choice == "required":
+        tools_prompt += "IMPORTANT: You MUST call one of the available functions in your response.\n"
+        ASCIIColors.cyan("Forcing required tool usage.")
+    else:
+        tools_prompt += "If the user input requires a tool, output the markdown wrapped JSON. If not, respond normally with text.\n"
+
+    system_found = False
+    for msg in messages:
+        if msg.get('role') == 'system':
+            msg['content'] = (msg.get('content') or "") + tools_prompt
+            system_found = True
+            break
+    
+    if not system_found:
+        messages.insert(0, {"role": "system", "content": tools_prompt})
+    
+    ASCIIColors.yellow("--- TOOL INJECTION END ---")
+    return messages
+
+
+def extract_json_candidates(text: str) -> List[str]:
+    """
+    Scans the text for valid top-level JSON objects by matching braces.
+    """
+    candidates = []
+    brace_count = 0
+    start_index = -1
+    in_string = False
+    escape = False
+
+    for i, char in enumerate(text):
+        if char == '"' and not escape:
+            in_string = not in_string
+        
+        if not in_string:
+            if char == '{':
+                if brace_count == 0:
+                    start_index = i
+                brace_count += 1
+            elif char == '}':
+                if brace_count > 0:
+                    brace_count -= 1
+                    if brace_count == 0:
+                        candidates.append(text[start_index : i+1])
+                        start_index = -1
+        
+        if char == '\\':
+            escape = not escape
+        else:
+            escape = False
+            
+    return candidates
+
+
+def parse_tool_calls_from_text(content: Any) -> Tuple[Optional[str], Optional[List[ToolCall]]]:
+    """
+    Parses the LLM output to find JSON tool calls.
+    PRIORITIZES content inside ```json code blocks, but falls back to scanning.
+    """
+    ASCIIColors.yellow("--- TOOL PARSING START ---")
+    
+    if not content:
+        return None, None
+    
+    # Ensure content is a string before processing to avoid TypeErrors
+    if not isinstance(content, str):
+        content = str(content)
+
+    ASCIIColors.cyan(f"Raw LLM Output (First 500 chars):\n{content[:500]}...")
+
+    valid_tool_call_data = None
+    matched_text_segment = None
+
+    # Strategy 1: Look for Markdown Code Blocks (Most Reliable)
+    code_block_pattern = r"```(?:json|JSON)?\s*(.*?)\s*```"
+    code_blocks = re.findall(code_block_pattern, content, re.DOTALL | re.IGNORECASE)
+    
+    if code_blocks:
+        ASCIIColors.info(f"Found {len(code_blocks)} code blocks.")
+        for block in code_blocks:
+            clean_block = block.strip()
+            if "tool_calls" in clean_block:
+                try:
+                    data = json.loads(clean_block)
+                    if isinstance(data, dict) and "tool_calls" in data:
+                        valid_tool_call_data = data
+                        matched_text_segment = block
+                        break
+                except json.JSONDecodeError:
+                    try:
+                        repaired = clean_block.replace("'", '"').replace("True", "true").replace("False", "false")
+                        data = json.loads(repaired)
+                        if isinstance(data, dict) and "tool_calls" in data:
+                            valid_tool_call_data = data
+                            matched_text_segment = block
+                            break
+                    except: pass
+    
+    # Strategy 2: Fallback to scanning raw text for JSON objects
+    if not valid_tool_call_data:
+        ASCIIColors.info("Scanning raw text for JSON candidates (Fallback)...")
+        candidates = extract_json_candidates(content)
+        for candidate in candidates:
+            if "tool_calls" in candidate:
+                try:
+                    data = json.loads(candidate)
+                    if isinstance(data, dict) and "tool_calls" in data:
+                        valid_tool_call_data = data
+                        matched_text_segment = candidate
+                        break
+                except json.JSONDecodeError:
+                    try:
+                        repaired = candidate.replace("'", '"').replace("True", "true").replace("False", "false")
+                        data = json.loads(repaired)
+                        if isinstance(data, dict) and "tool_calls" in data:
+                            valid_tool_call_data = data
+                            matched_text_segment = candidate
+                            break
+                    except: pass
+
+    if valid_tool_call_data:
+        openai_tool_calls = []
+        if isinstance(valid_tool_call_data.get("tool_calls"), list):
+            for tc in valid_tool_call_data["tool_calls"]:
+                try:
+                    args = tc.get("arguments", {})
+                    if isinstance(args, dict):
+                        args_str = json.dumps(args)
+                    else:
+                        args_str = str(args)
+
+                    # Generate ID compliant with strict Mistral/LiteLLM requirements (9 alphanum chars)
+                    t_id = generate_mistral_compatible_id()
+
+                    tool_call = ToolCall(
+                        id=t_id,
+                        type="function",
+                        function=FunctionCall(
+                            name=tc.get("name"),
+                            arguments=args_str
+                        )
+                    )
+                    openai_tool_calls.append(tool_call)
+                except Exception as e:
+                    ASCIIColors.warning(f"Skipping malformed tool call: {e}")
+
+        if openai_tool_calls:
+            ASCIIColors.success(f"Successfully parsed {len(openai_tool_calls)} tool calls.")
+            
+            final_content = None
+            if matched_text_segment:
+                idx = content.find(matched_text_segment)
+                if idx > 0:
+                    text_before = content[:idx]
+                    text_before = re.sub(r'```(?:json|JSON)?\s*$', '', text_before, flags=re.IGNORECASE).strip()
+                    if text_before:
+                        final_content = text_before
+            
+            ASCIIColors.yellow("--- TOOL PARSING END (Success) ---")
+            return final_content, openai_tool_calls
+
+    ASCIIColors.red("No valid 'tool_calls' structure found.")
+    ASCIIColors.yellow("--- TOOL PARSING END (No Tools) ---")
+    return content, None
+
+
 # --- Routes ---
 
 @openai_v1_router.get("/models")
@@ -329,6 +566,7 @@ async def list_models(
     user: DBUser = Depends(get_user_from_api_key),
     db: Session = Depends(get_db)
 ):
+    ASCIIColors.info(f"---------------> {user.username} is listing the models")
     all_models = []
     active_bindings = db.query(DBLLMBinding).filter(DBLLMBinding.is_active == True).all()
     model_display_mode = settings.get("model_display_mode", "mixed")
@@ -356,14 +594,10 @@ async def list_models(
                     if model_display_mode == 'aliased' and not alias_data:
                         continue
 
-                    # The ID is ALWAYS binding/model_name for the API's internal use.
                     id_to_send = f"{binding.alias}/{model_id}"
-                    
-                    # The name is what's displayed to the user.
                     name_to_send = id_to_send
                     if model_display_mode != 'original' and alias_data and alias_data.get('title'):
                         name_to_send = alias_data.get('title')
-
 
                     all_models.append({
                         "id": id_to_send,
@@ -379,7 +613,6 @@ async def list_models(
     if not all_models:
         raise HTTPException(status_code=404, detail="No models found from any active bindings.")
     
-    # Use 'id' for uniqueness as it's the stable identifier
     unique_models = {m["id"]: m for m in all_models}
     return {"object": "list", "data": sorted(list(unique_models.values()), key=lambda x: x['id'])}
 
@@ -389,9 +622,6 @@ async def list_personalities(
     user: DBUser = Depends(get_user_from_api_key),
     db: Session = Depends(get_db)
 ):
-    """
-    Lists all personalities available to the authenticated user (owned and public).
-    """
     personalities_db = db.query(DBPersonality).options(joinedload(DBPersonality.owner)).filter(
         or_(
             DBPersonality.is_public == True,
@@ -408,69 +638,14 @@ async def list_personalities(
         
     return PersonalityListResponse(data=response_data)
 
-def to_image_block(img, default_mime="image/jpeg"):
-    # img can be: https URL, data URL, or raw base64
-    if isinstance(img, dict):
-        # Optional pattern: {'data': '<base64>', 'mime': 'image/png'} or {'url': 'https://...'}
-        if "url" in img:
-            url = img["url"]
-            return {"type": "image_url", "image_url": {"url": url}}
-        if "data" in img:
-            mime = img.get("mime", default_mime)
-            return {
-                "type": "image_url",
-                "image_url": {"url": f"data:{mime};base64,{img['data']}"}
-            }
-
-    if isinstance(img, str):
-        s = img.strip()
-        if s.startswith("http://") or s.startswith("https://"):
-            return {"type": "image_url", "image_url": {"url": s}}
-        if s.startswith("data:"):
-            return {"type": "image_url", "image_url": {"url": s}}
-        # raw base64: add data URL prefix
-        return {
-            "type": "image_url",
-            "image_url": {"url": f"data:{default_mime};base64,{s}"}
-        }
-
-    raise ValueError("Unsupported image input format")
-
-# --- Helper to Extract Images and Convert Messages ---
-def preprocess_messages(messages: List[ChatMessage]) -> List[Dict]:
-    processed = []
-    image_list = []
-
-    for msg in messages:
-        content = msg.content
-        if isinstance(content, str):
-            processed.append({"role": msg.role, "content": content})
-        elif isinstance(content, list):
-            text_parts = []
-            for item in content:
-                if item.get("type") == "image_url":
-                    base64_img = item["image_url"].get("base64")
-                    if base64_img:
-                        image_list.append(base64_img)
-                    url_img = item["image_url"].get("url")
-                    if url_img:
-                        image_list.append(url_img)
-                elif item.get("type") == "text":
-                    text_parts.append(item.get("text", ""))
-                else:
-                    text_parts.append(str(item))
-            processed.append({"role": msg.role, "content": "\n".join(text_parts)})
-        else:
-            processed.append({"role": msg.role, "content": str(content)})
-
-    return processed, image_list
-
 @openai_v1_router.post("/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
     user: DBUser = Depends(get_user_from_api_key),
     db: Session = Depends(get_db)
 ):
+    ASCIIColors.bold(f"Received Chat Completion Request. Model: {request.model}, Stream: {request.stream}")
+
     binding_alias, model_name = resolve_model_name(db, request.model)
 
     try:
@@ -487,7 +662,6 @@ async def chat_completions(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to build LLM client: {str(e)}")
 
-    # Handle personality as a system message if provided
     messages = list(request.messages)
     if request.personality:
         personality = db.query(DBPersonality).filter(DBPersonality.id == request.personality).first()
@@ -498,120 +672,201 @@ async def chat_completions(
         messages.insert(0, ChatMessage(role="system", content=personality.prompt_text))
 
     openai_messages, images = preprocess_openai_messages(messages)
+    
+    if request.tools:
+        openai_messages = handle_tools_injection(openai_messages, request.tools, request.tool_choice)
+
+    generation_kwargs = {}
+    if request.reasoning_effort:
+        generation_kwargs["reasoning_effort"] = request.reasoning_effort
+
     ASCIIColors.info(f"Received images: {len(images)}")
 
-    # --- Streaming ---
     if request.stream:
         async def stream_generator():
-            main_loop = asyncio.get_running_loop()
-            stream_queue = asyncio.Queue()
-            stop_event = threading.Event()
+            try:
+                if request.tools:
+                    ASCIIColors.info("Tools requested in stream mode. Buffering generation for safe parsing...")
+                    
+                    result_content = await asyncio.to_thread(
+                        lc.generate_from_messages,
+                        openai_messages,
+                        temperature=request.temperature,
+                        n_predict=request.max_tokens,
+                        images=images,
+                        **generation_kwargs
+                    )
 
-            completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-            created_ts = int(time.time())
+                    content, tool_calls = parse_tool_calls_from_text(result_content)
 
-            # First event: role assistant
-            first_chunk = ChatCompletionStreamResponse(
-                id=completion_id,
-                model=request.model,
-                created=created_ts,
-                choices=[ChatCompletionResponseStreamChoice(
-                    index=0,
-                    delta=DeltaMessage(role="assistant"),
-                    finish_reason=None
-                )]
-            )
-            yield f"data: {first_chunk.model_dump_json()}\n\n".encode('utf-8')
+                    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+                    created_ts = int(time.time())
 
-            def llm_callback(chunk: str, msg_type: MSG_TYPE, **kwargs) -> bool:
-                if stop_event.is_set():
-                    return False
-                if msg_type == MSG_TYPE.MSG_TYPE_CHUNK and chunk:  # Ensure chunk is not empty
-                    response_chunk = ChatCompletionStreamResponse(
+                    chunk = ChatCompletionStreamResponse(
                         id=completion_id,
                         model=request.model,
                         created=created_ts,
-                        choices=[ChatCompletionResponseStreamChoice(
-                            index=0,
-                            delta=DeltaMessage(content=chunk)
-                        )]
+                        choices=[ChatCompletionResponseStreamChoice(index=0, delta=DeltaMessage(role="assistant"))]
                     )
-                    try:
-                        json_data = response_chunk.model_dump_json()
-                        main_loop.call_soon_threadsafe(
-                            stream_queue.put_nowait,
-                            f"data: {json_data}\n\n".encode('utf-8')
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+
+                    if content:
+                        chunk = ChatCompletionStreamResponse(
+                            id=completion_id,
+                            model=request.model,
+                            created=created_ts,
+                            choices=[ChatCompletionResponseStreamChoice(index=0, delta=DeltaMessage(content=content))]
                         )
-                    except Exception as e:
-                        print(f"Error serializing chunk: {e}")
-                return True
+                        yield f"data: {chunk.model_dump_json()}\n\n"
 
-            def blocking_call():
-                try:
-                    print("Starting generate_from_messages")  # Debug log
-                    lc.generate_from_messages(
-                        openai_messages,
-                        streaming_callback=llm_callback,
-                        images=images,
-                        temperature=request.temperature,
-                        n_predict=request.max_tokens,
-                        stream=True
+                    if tool_calls:
+                        for i, tc in enumerate(tool_calls):
+                            tc.index = i
+                            chunk = ChatCompletionStreamResponse(
+                                id=completion_id,
+                                model=request.model,
+                                created=created_ts,
+                                choices=[ChatCompletionResponseStreamChoice(
+                                    index=0,
+                                    delta=DeltaMessage(tool_calls=[tc])
+                                )]
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                    
+                    finish_reason = "tool_calls" if tool_calls else "stop"
+                    chunk = ChatCompletionStreamResponse(
+                        id=completion_id,
+                        model=request.model,
+                        created=created_ts,
+                        choices=[ChatCompletionResponseStreamChoice(index=0, delta=DeltaMessage(), finish_reason=finish_reason)]
                     )
-                    print("Finished generate_from_messages")  # Debug log
-                except Exception as e:
-                    print(f"Streaming error: {e}")
-                finally:
-                    main_loop.call_soon_threadsafe(stream_queue.put_nowait, None)
+                    yield f"data: {chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
 
-            threading.Thread(target=blocking_call, daemon=True).start()
+                else:
+                    main_loop = asyncio.get_running_loop()
+                    stream_queue = asyncio.Queue()
+                    stop_event = threading.Event()
+                    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+                    created_ts = int(time.time())
 
-            while True:
-                item = await stream_queue.get()
-                if item is None:
-                    break
-                if item.strip():  # Ensure item is not empty
-                    yield item
+                    def llm_callback(chunk_text: str, msg_type: MSG_TYPE, **kwargs) -> bool:
+                        if stop_event.is_set(): return False
+                        if msg_type == MSG_TYPE.MSG_TYPE_CHUNK and chunk_text:
+                            response_chunk = ChatCompletionStreamResponse(
+                                id=completion_id,
+                                model=request.model,
+                                created=created_ts,
+                                choices=[ChatCompletionResponseStreamChoice(
+                                    index=0,
+                                    delta=DeltaMessage(content=chunk_text)
+                                )]
+                            )
+                            main_loop.call_soon_threadsafe(
+                                stream_queue.put_nowait,
+                                f"data: {response_chunk.model_dump_json()}\n\n"
+                            )
+                        return True
 
-            # Final chunk
-            end_chunk = ChatCompletionStreamResponse(
-                id=completion_id,
-                model=request.model,
-                created=created_ts,
-                choices=[ChatCompletionResponseStreamChoice(
-                    index=0,
-                    delta=DeltaMessage(),
-                    finish_reason="stop"
-                )]
-            )
-            yield f"data: {end_chunk.model_dump_json()}\n\n".encode('utf-8')
-            yield "data: [DONE]\n\n".encode('utf-8')
+                    def blocking_gen():
+                        try:
+                            lc.generate_from_messages(
+                                openai_messages,
+                                streaming_callback=llm_callback,
+                                images=images,
+                                temperature=request.temperature,
+                                n_predict=request.max_tokens,
+                                stream=True,
+                                **generation_kwargs
+                            )
+                        except Exception as ex:
+                            ASCIIColors.error(f"Streaming Generation Error: {ex}")
+                        finally:
+                            main_loop.call_soon_threadsafe(stream_queue.put_nowait, None)
 
-        return EventSourceResponse(stream_generator(), media_type="text/event-stream")
+                    threading.Thread(target=blocking_gen, daemon=True).start()
 
-    # --- Non-streaming ---
+                    start_chunk = ChatCompletionStreamResponse(
+                        id=completion_id,
+                        model=request.model,
+                        created=created_ts,
+                        choices=[ChatCompletionResponseStreamChoice(index=0, delta=DeltaMessage(role="assistant"))]
+                    )
+                    yield f"data: {start_chunk.model_dump_json()}\n\n"
+
+                    while True:
+                        item = await stream_queue.get()
+                        if item is None:
+                            break
+                        yield item
+
+                    end_chunk = ChatCompletionStreamResponse(
+                        id=completion_id,
+                        model=request.model,
+                        created=created_ts,
+                        choices=[ChatCompletionResponseStreamChoice(index=0, delta=DeltaMessage(), finish_reason="stop")]
+                    )
+                    yield f"data: {end_chunk.model_dump_json()}\n\n"
+                    yield "data: [DONE]\n\n"
+
+            except Exception as e:
+                ASCIIColors.error(f"Stream Generator Crash: {e}")
+                yield "data: [DONE]\n\n"
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
     else:
         try:
-            result = lc.generate_from_messages(
+            ASCIIColors.info("Generating non-streaming response...")
+            result_content = lc.generate_from_messages(
                 openai_messages,
                 temperature=request.temperature,
-                n_predict=request.max_tokens
+                n_predict=request.max_tokens,
+                images=images,
+                **generation_kwargs
             )
+            
+            content = result_content
+            finish_reason = "stop"
+            tool_calls = None
+
+            if request.tools:
+                content, tool_calls = parse_tool_calls_from_text(result_content)
+                if tool_calls:
+                    finish_reason = "tool_calls"
+                    ASCIIColors.success(f"Parsed {len(tool_calls)} tool calls.")
+            
+            if tool_calls and not content:
+                content = None
+
+            msg_obj = ChatMessage(
+                role="assistant", 
+                content=content,
+                tool_calls=tool_calls
+            )
+
+            choice = ChatCompletionResponseChoice(
+                index=0,
+                message=msg_obj,
+                finish_reason=finish_reason
+            )
+
             prompt_tokens = lc.count_tokens(str(openai_messages))
-            completion_tokens = lc.count_tokens(result)
+            completion_tokens = lc.count_tokens(result_content)
+            
             return ChatCompletionResponse(
+                id=f"chatcmpl-{uuid.uuid4().hex}",
                 model=request.model,
-                choices=[ChatCompletionResponseChoice(
-                    index=0,
-                    message=ChatMessage(role="assistant", content=result),
-                    finish_reason="stop"
-                )],
+                choices=[choice],
                 usage=UsageInfo(
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     total_tokens=prompt_tokens + completion_tokens
                 )
             )
+            
         except Exception as e:
+            trace_exception(e)
             raise HTTPException(status_code=500, detail=f"Generation error: {e}")
         
         
@@ -855,3 +1110,63 @@ async def extract_text_from_file(
     except Exception as e:
         trace_exception(e)
         raise HTTPException(status_code=500, detail=f"File extraction failed: {str(e)}")
+
+  
+   
+# KEEP THISE FUNCTIONS FOR COMPATIBILITY
+# --- Helper to Extract Images and Convert Messages ---
+def preprocess_messages(messages: List[ChatMessage]) -> List[Dict]:
+    processed = []
+    image_list = []
+
+    for msg in messages:
+        content = msg.content
+        if isinstance(content, str):
+            processed.append({"role": msg.role, "content": content})
+        elif isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if item.get("type") == "image_url":
+                    base64_img = item["image_url"].get("base64")
+                    if base64_img:
+                        image_list.append(base64_img)
+                    url_img = item["image_url"].get("url")
+                    if url_img:
+                        image_list.append(url_img)
+                elif item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                else:
+                    text_parts.append(str(item))
+            processed.append({"role": msg.role, "content": "\n".join(text_parts)})
+        else:
+            processed.append({"role": msg.role, "content": str(content)})
+
+    return processed, image_list
+
+def to_image_block(img, default_mime="image/jpeg"):
+    # img can be: https URL, data URL, or raw base64
+    if isinstance(img, dict):
+        # Optional pattern: {'data': '<base64>', 'mime': 'image/png'} or {'url': 'https://...'}
+        if "url" in img:
+            url = img["url"]
+            return {"type": "image_url", "image_url": {"url": url}}
+        if "data" in img:
+            mime = img.get("mime", default_mime)
+            return {
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{img['data']}"}
+            }
+
+    if isinstance(img, str):
+        s = img.strip()
+        if s.startswith("http://") or s.startswith("https://"):
+            return {"type": "image_url", "image_url": {"url": s}}
+        if s.startswith("data:"):
+            return {"type": "image_url", "image_url": {"url": s}}
+        # raw base64: add data URL prefix
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{default_mime};base64,{s}"}
+        }
+
+    raise ValueError("Unsupported image input format")

@@ -20,7 +20,6 @@ const TTSBindingsSettings = defineAsyncComponent(() => import('./bindings/TTSBin
 const STTBindingsSettings = defineAsyncComponent(() => import('./bindings/STTBindingsSettings.vue'));
 const RAGBindingsSettings = defineAsyncComponent(() => import('./bindings/RAGBindingsSettings.vue'));
 const AiBotSettings = defineAsyncComponent(() => import('./AiBotSettings.vue'));
-const ServicesSettings = defineAsyncComponent(() => import('../settings/ServicesSettings.vue'));
 const EmailSettings = defineAsyncComponent(() => import('./EmailSettings.vue'));
 const SSOClientSettings = defineAsyncComponent(() => import('./SSOClientSettings.vue'));
 const SCIMSettings = defineAsyncComponent(() => import('./SCIMSettings.vue'));
@@ -36,7 +35,7 @@ const WelcomeSettings = defineAsyncComponent(() => import('./WelcomeSettings.vue
 const RssManagement = defineAsyncComponent(() => import('./RssManagement.vue'));
 const NewsFeedSettings = defineAsyncComponent(() => import('./NewsFeedSettings.vue'));
 const NewsManagement = defineAsyncComponent(() => import('./NewsManagement.vue'));
-
+const ModerationQueue = defineAsyncComponent(() => import('./ModerationQueue.vue')); // New Import
 
 const tabs = [
     { id: 'dashboard', component: Dashboard },
@@ -51,7 +50,6 @@ const tabs = [
     { id: 'rag_bindings', component: RAGBindingsSettings },
     { id: 'builders', component: BuildersSettings },
     { id: 'ai_bot', component: AiBotSettings },
-    { id: 'services', component: ServicesSettings },
     { id: 'apps', component: AppsManagement },
     { id: 'mcps', component: McpsManagement },
     { id: 'personalities', component: PersonalitiesManagement },
@@ -65,6 +63,7 @@ const tabs = [
     { id: 'rss_feeds', component: RssManagement },
     { id: 'news_feed_settings', component: NewsFeedSettings },
     { id: 'news_management', component: NewsManagement },
+    { id: 'moderation', component: ModerationQueue }, // New Tab
 ];
 
 const activeComponent = computed(() => {

@@ -74,6 +74,12 @@ from backend.routers.zoos.personalities_zoo import personalities_zoo_router
 from backend.routers.discussion_groups import discussion_groups_router
 from backend.routers.voices_studio import voices_studio_router
 from backend.routers.image_studio import image_studio_router
+from backend.routers.notes import notes_router 
+from backend.routers.public import public_router # NEW: Public Router
+
+from backend.routers.admin.email_marketing import router as email_marketing_router 
+from backend.db.models.email_marketing import EmailProposal, EmailTopic 
+from backend.tasks.email_tasks import _generate_email_proposal_task 
 
 from backend.routers.tasks import tasks_router
 from backend.task_manager import task_manager
@@ -82,6 +88,7 @@ from backend.routers.help import help_router
 from backend.routers.prompts import prompts_router
 from backend.routers.memories import memories_router
 from backend.routers.news import news_router
+from backend.routers.public import public_router
 from backend.zoo_cache import load_cache
 
 import uvicorn
@@ -90,11 +97,12 @@ from backend.settings import settings
 # --- RSS Feed Imports ---
 from apscheduler.schedulers.background import BackgroundScheduler
 from backend.tasks.news_tasks import _scrape_rss_feeds_task, _cleanup_old_news_articles_task
+from backend.tasks.social_tasks import _generate_feed_post_task 
 # --- End RSS Feed Imports ---
 
 broadcast_listener_task = None
 rss_scheduler = None
-startup_lock = Lock() # Moved to global scope
+startup_lock = Lock() 
 
 def scheduled_rss_job():
     """
@@ -122,6 +130,28 @@ def scheduled_news_cleanup_job():
         target=_cleanup_old_news_articles_task,
         description="Deleting old news articles based on retention policy.",
         owner_username=None # System task
+    )
+
+def scheduled_bot_posting_job():
+    """
+    Wrapper function to submit the AI bot auto-posting task.
+    """
+    task_manager.submit_task(
+        name="AI Bot Auto-Posting",
+        target=_generate_feed_post_task,
+        description="Generating and posting social feed content from AI Bot.",
+        owner_username=None
+    )
+
+def scheduled_email_proposal_job():
+    """
+    Wrapper for email proposal generation.
+    """
+    task_manager.submit_task(
+        name="Generate Email Proposal",
+        target=_generate_email_proposal_task,
+        description="Lollms researching and drafting email content.",
+        owner_username=None
     )
 
 
@@ -405,10 +435,11 @@ async def startup_event():
     # We can't directly check the lock state across processes easily, but we can assume
     # the main process is the first one to start. This is a reasonable heuristic.
     if os.getpid() == os.getppid() or os.getenv("WORKER_ID") == "1":
+        # Initialize scheduler
+        rss_scheduler = BackgroundScheduler(daemon=True)
+
         if settings.get("rss_feed_enabled"):
             interval = settings.get("rss_feed_check_interval_minutes", 60)
-            rss_scheduler = BackgroundScheduler(daemon=True)
-            # Give the app a few seconds to start before the first run
             next_run = datetime.datetime.now() + datetime.timedelta(seconds=20)
             rss_scheduler.add_job(scheduled_rss_job, 'interval', minutes=interval, next_run_time=next_run)
             
@@ -420,8 +451,24 @@ async def startup_event():
                 print(f"INFO: Daily news cleanup scheduled. Articles older than {retention_days} day(s) will be removed.")
             # --- END NEW ---
 
-            rss_scheduler.start()
             print(f"INFO: RSS feed checking scheduled to run every {interval} minutes.")
+        
+        # --- NEW: Schedule Bot Auto-Posting (Check every 30 mins) ---
+        # The task itself checks the "last_posted_at" timestamp against the configured interval.
+        rss_scheduler.add_job(scheduled_bot_posting_job, 'interval', minutes=30, next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=1))
+        # --- END NEW ---
+
+        # Schedule Email Generation (e.g., every 24 hours)
+        if settings.get("email_marketing_enabled", False):
+            rss_scheduler.add_job(
+                scheduled_email_proposal_job, 
+                'interval', 
+                hours=24, 
+                next_run_time=datetime.datetime.now() + datetime.timedelta(minutes=5)
+            )
+
+        if not rss_scheduler.running:
+            rss_scheduler.start()
 
     print(f"INFO: Worker {os.getpid()} starting DB broadcast listener.")
 
@@ -444,7 +491,7 @@ app = FastAPI(
     on_startup=[startup_event],
     on_shutdown=[shutdown_event]
 )
-
+app.include_router(email_marketing_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(languages_router)
@@ -484,6 +531,8 @@ app.include_router(build_discussions_router())
 app.include_router(discussion_groups_router)
 app.include_router(voices_studio_router)
 app.include_router(image_studio_router)
+app.include_router(notes_router)
+app.include_router(public_router) # Include public router
 
 
 add_ui_routes(app)

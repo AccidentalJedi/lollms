@@ -1,6 +1,11 @@
 # [UPDATE] backend/routers/admin/bindings_management.py
 import json
+import io
+import base64
+import inspect
 from typing import List, Dict, Any, Optional
+from PIL import Image
+from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
@@ -15,7 +20,7 @@ from lollms_client.lollms_stt_binding import get_available_bindings as get_avail
 from backend.db import get_db
 from backend.db.models.user import User as DBUser
 from backend.db.models.config import LLMBinding as DBLLMBinding, TTIBinding as DBTTIBinding, TTSBinding as DBTTSBinding, STTBinding as DBSTTBinding
-from backend.models import UserAuthDetails, ForceSettingsPayload, ModelInfo
+from backend.models import UserAuthDetails, ForceSettingsPayload, ModelInfo, TaskInfo
 from backend.models.admin import (
     LLMBindingCreate, LLMBindingUpdate, LLMBindingPublicAdmin,
     TTIBindingCreate, TTIBindingUpdate, TTIBindingPublicAdmin,
@@ -24,17 +29,22 @@ from backend.models.admin import (
     ModelAliasUpdate, TtiModelAliasUpdate, TtsModelAliasUpdate, SttModelAliasUpdate,
     ModelAliasDelete, BindingModel, ModelNamePayload
 )
+from backend.models.personality_generation import GenerateIconRequest
 from backend.session import (
     get_current_admin_user,
     user_sessions,
     get_user_lollms_client,
     build_lollms_client_from_params
 )
-from backend.session import get_user_lollms_client, user_sessions, build_lollms_client_from_params
 from backend.ws_manager import manager
+from backend.task_manager import task_manager, Task
 from ascii_colors import trace_exception, ASCIIColors
 
 bindings_management_router = APIRouter()
+
+class BindingCommandRequest(BaseModel):
+    command_name: str
+    parameters: Dict[str, Any] = {}
 
 def _process_binding_config(binding_name: str, config: Dict[str, Any], binding_type: str = "llm") -> Dict[str, Any]:
     """Casts config values to their correct types based on binding description."""
@@ -83,6 +93,117 @@ def _process_binding_config(binding_name: str, config: Dict[str, Any], binding_t
             processed_config[key] = value
 
     return processed_config
+
+def _execute_binding_command_task(task: Task, binding_type: str, binding_data: Dict, command_name: str, parameters: Dict[str, Any], username: str):
+    task.log(f"Starting execution of command '{command_name}' for {binding_type.upper()} binding '{binding_data['alias']}'...")
+    task.set_progress(10)
+    
+    try:
+        service = None
+        if binding_type == "llm":
+            # For LLM, we leverage the user's existing client context to ensure loaded models are reused if possible
+            lc = get_user_lollms_client(username, binding_data['alias'])
+            service = lc.llm
+        elif binding_type == "tti":
+            client_params = { "tti_binding_name": binding_data['name'], "tti_binding_config": { **binding_data['config'], "model_name": binding_data['default_model_name'] } }
+            lc = LollmsClient(**client_params)
+            service = lc.tti
+        elif binding_type == "tts":
+            client_params = { "tts_binding_name": binding_data['name'], "tts_binding_config": { **binding_data['config'], "model_name": binding_data['default_model_name'] } }
+            lc = LollmsClient(**client_params)
+            service = lc.tts
+        elif binding_type == "stt":
+            client_params = { "stt_binding_name": binding_data['name'], "stt_binding_config": { **binding_data['config'], "model_name": binding_data['default_model_name'] } }
+            lc = LollmsClient(**client_params)
+            service = lc.stt
+        else:
+            raise ValueError(f"Unknown binding type: {binding_type}")
+
+        if not service:
+             raise Exception(f"{binding_type.upper()} engine could not be initialized. Please check configuration.")
+
+        if hasattr(service, command_name):
+             method = getattr(service, command_name)
+             if callable(method):
+                 task.log(f"Executing method: {command_name}")
+                 
+                 # Check signature for callback
+                 sig = inspect.signature(method)
+                 if 'callback' in sig.parameters:
+                     def progress_callback(data: dict):
+                         # Expected format: {'status': str, 'completed': int, 'total': int}
+                         status = data.get('status', 'Processing...')
+                         task.log(status)
+                         
+                         total = data.get('total', 100)
+                         completed = data.get('completed', 0)
+                         if total > 0:
+                             percent = (completed / total) * 100
+                             task.set_progress(percent)
+                             
+                     parameters['callback'] = progress_callback
+                 
+                 result = method(**parameters)
+                 task.log(f"Command '{command_name}' completed successfully.")
+                 task.set_progress(100)
+                 return result
+        
+        raise Exception(f"Command '{command_name}' not supported by binding '{binding_data['name']}'.")
+        
+    except Exception as e:
+        task.log(f"Command execution failed: {e}", "ERROR")
+        trace_exception(e)
+        raise e
+
+def _generate_model_icon_task(task: Task, username: str, prompt: str):
+    task.log("Starting model icon generation...")
+    task.set_progress(10)
+    
+    try:
+        lc = get_user_lollms_client(username)
+        if not lc.tti:
+            raise Exception("Text-to-Image service is not configured for this user.")
+
+        task.log("Generating image using TTI engine...")
+        # Generate image as raw bytes (not base64)
+        img_data = lc.tti.generate_image(prompt, width=512, height=512)
+        
+        # If API returns a list, pick the first
+        if isinstance(img_data, (list, tuple)):
+            if not img_data:
+                raise Exception("Image generation returned empty list.")
+            img_data = img_data[0]
+
+        # If the provider sometimes returns a data URI or base64 str, normalize:
+        if isinstance(img_data, str):
+            # Remove any data URI prefix if present
+            if img_data.startswith("data:"):
+                img_data = img_data.split(",", 1)[1]
+            # Base64 string -> raw bytes
+            img_data = base64.b64decode(img_data)
+
+        if not isinstance(img_data, (bytes, bytearray)):
+            raise Exception(f"Unsupported image payload type from generator: {type(img_data)}")
+
+        task.set_progress(80)
+        task.log("Processing image...")
+
+        with Image.open(io.BytesIO(img_data)) as img:
+            if img.mode not in ("RGB", "RGBA"):
+                img = img.convert("RGBA")
+            img.thumbnail((128, 128))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            icon_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+        task.log("Icon generated successfully.")
+        task.set_progress(100)
+        return {"icon_base64": f"data:image/png;base64,{icon_b64}"}
+
+    except Exception as e:
+        task.log(f"Icon generation failed: {e}", "ERROR")
+        trace_exception(e)
+        raise e
 
 @bindings_management_router.get("/bindings/available_types", response_model=List[Dict])
 async def get_available_binding_types():
@@ -161,6 +282,28 @@ async def delete_binding(binding_id: int, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
+@bindings_management_router.post("/bindings/{binding_id}/execute_command", response_model=TaskInfo, status_code=202)
+async def execute_llm_binding_command(binding_id: int, payload: BindingCommandRequest, current_user: UserAuthDetails = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    binding = db.query(DBLLMBinding).filter(DBLLMBinding.id == binding_id).first()
+    if not binding: raise HTTPException(status_code=404, detail="Binding not found.")
+    
+    binding_data = {
+        "id": binding.id,
+        "name": binding.name,
+        "alias": binding.alias,
+        "config": binding.config,
+        "default_model_name": binding.default_model_name
+    }
+    
+    task = task_manager.submit_task(
+        name=f"Exec LLM Cmd: {payload.command_name}",
+        target=_execute_binding_command_task,
+        args=("llm", binding_data, payload.command_name, payload.parameters, current_user.username),
+        description=f"Executing command {payload.command_name} on binding {binding.alias}",
+        owner_username=current_user.username
+    )
+    return task
+
 @bindings_management_router.get("/tti-bindings/available_types", response_model=List[Dict])
 async def get_available_tti_binding_types():
     try:
@@ -237,6 +380,28 @@ async def delete_tti_binding(binding_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@bindings_management_router.post("/tti-bindings/{binding_id}/execute_command", response_model=TaskInfo, status_code=202)
+async def execute_tti_binding_command(binding_id: int, payload: BindingCommandRequest, current_user: UserAuthDetails = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    binding = db.query(DBTTIBinding).filter(DBTTIBinding.id == binding_id).first()
+    if not binding: raise HTTPException(status_code=404, detail="TTI Binding not found.")
+    
+    binding_data = {
+        "id": binding.id,
+        "name": binding.name,
+        "alias": binding.alias,
+        "config": binding.config,
+        "default_model_name": binding.default_model_name
+    }
+    
+    task = task_manager.submit_task(
+        name=f"Exec TTI Cmd: {payload.command_name}",
+        target=_execute_binding_command_task,
+        args=("tti", binding_data, payload.command_name, payload.parameters, current_user.username),
+        description=f"Executing command {payload.command_name} on binding {binding.alias}",
+        owner_username=current_user.username
+    )
+    return task
 
 @bindings_management_router.get("/tti-bindings/{binding_id}/models", response_model=List[BindingModel])
 async def get_tti_binding_models(binding_id: int, db: Session = Depends(get_db)):
@@ -368,6 +533,28 @@ async def delete_tts_binding(binding_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@bindings_management_router.post("/tts-bindings/{binding_id}/execute_command", response_model=TaskInfo, status_code=202)
+async def execute_tts_binding_command(binding_id: int, payload: BindingCommandRequest, current_user: UserAuthDetails = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    binding = db.query(DBTTSBinding).filter(DBTTSBinding.id == binding_id).first()
+    if not binding: raise HTTPException(status_code=404, detail="TTS Binding not found.")
+    
+    binding_data = {
+        "id": binding.id,
+        "name": binding.name,
+        "alias": binding.alias,
+        "config": binding.config,
+        "default_model_name": binding.default_model_name
+    }
+    
+    task = task_manager.submit_task(
+        name=f"Exec TTS Cmd: {payload.command_name}",
+        target=_execute_binding_command_task,
+        args=("tts", binding_data, payload.command_name, payload.parameters, current_user.username),
+        description=f"Executing command {payload.command_name} on binding {binding.alias}",
+        owner_username=current_user.username
+    )
+    return task
 
 @bindings_management_router.get("/tts-bindings/{binding_id}/models", response_model=List[BindingModel])
 async def get_tts_binding_models(binding_id: int, db: Session = Depends(get_db)):
@@ -501,6 +688,28 @@ async def delete_stt_binding(binding_id: int, db: Session = Depends(get_db)):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@bindings_management_router.post("/stt-bindings/{binding_id}/execute_command", response_model=TaskInfo, status_code=202)
+async def execute_stt_binding_command(binding_id: int, payload: BindingCommandRequest, current_user: UserAuthDetails = Depends(get_current_admin_user), db: Session = Depends(get_db)):
+    binding = db.query(DBSTTBinding).filter(DBSTTBinding.id == binding_id).first()
+    if not binding: raise HTTPException(status_code=404, detail="STT Binding not found.")
+    
+    binding_data = {
+        "id": binding.id,
+        "name": binding.name,
+        "alias": binding.alias,
+        "config": binding.config,
+        "default_model_name": binding.default_model_name
+    }
+    
+    task = task_manager.submit_task(
+        name=f"Exec STT Cmd: {payload.command_name}",
+        target=_execute_binding_command_task,
+        args=("stt", binding_data, payload.command_name, payload.parameters, current_user.username),
+        description=f"Executing command {payload.command_name} on binding {binding.alias}",
+        owner_username=current_user.username
+    )
+    return task
 
 @bindings_management_router.get("/stt-bindings/{binding_id}/models", response_model=List[BindingModel])
 async def get_stt_binding_models(binding_id: int, db: Session = Depends(get_db)):
@@ -674,3 +883,17 @@ async def force_settings_once(payload: ForceSettingsPayload, db: Session = Depen
         db.rollback()
         trace_exception(e)
         raise HTTPException(status_code=500, detail=f"Database error while forcing settings: {e}")
+
+@bindings_management_router.post("/bindings/generate_icon", response_model=TaskInfo, status_code=202)
+async def generate_model_icon(
+    payload: GenerateIconRequest,
+    current_user: UserAuthDetails = Depends(get_current_admin_user),
+):
+    task = task_manager.submit_task(
+        name="Generate Model Icon",
+        target=_generate_model_icon_task,
+        args=(current_user.username, payload.prompt),
+        description="Generating icon from prompt for model alias.",
+        owner_username=current_user.username
+    )
+    return task
